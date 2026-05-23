@@ -1,22 +1,23 @@
 /**
- * Freddy Bot — Friendly AI Agent for Telegram
- * Powered by Groq + node-telegram-bot-api + Express (for Render keep-alive)
+ * Freddy Bot v2 — Friendly AI Agent for Telegram
+ * Features: Web Search, Voice TTS, Link Summarizer, File Creation
  *
- * Setup on Render:
- *   1. New Web Service → connect your GitHub repo with this file
- *   2. Build Command:  npm install
- *   3. Start Command:  node freddy_bot.js
- *   4. Add Environment Variables:
- *        TELEGRAM_TOKEN = your_bot_token
- *        GROQ_API_KEY   = your_groq_key
- *        PORT           = 3000  (Render sets this automatically)
+ * npm install node-telegram-bot-api groq-sdk express axios cheerio gtts
  *
- * Then add your Render URL to UptimeRobot to ping every 5 minutes.
+ * Env vars:
+ *   TELEGRAM_TOKEN
+ *   GROQ_API_KEY
  */
 
 const TelegramBot = require("node-telegram-bot-api");
 const Groq        = require("groq-sdk");
 const express     = require("express");
+const axios       = require("axios");
+const cheerio     = require("cheerio");
+const gTTS        = require("gtts");
+const fs          = require("fs");
+const path        = require("path");
+const os          = require("os");
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -24,151 +25,244 @@ const GROQ_API_KEY   = process.env.GROQ_API_KEY;
 const PORT           = process.env.PORT || 3000;
 
 if (!TELEGRAM_TOKEN || !GROQ_API_KEY) {
-  console.error("❌  Set TELEGRAM_TOKEN and GROQ_API_KEY env vars.");
+  console.error("❌ Set TELEGRAM_TOKEN and GROQ_API_KEY env vars.");
   process.exit(1);
 }
 
-// ── Express keep-alive server ────────────────────────────────────────────────
+// ── Express keep-alive ───────────────────────────────────────────────────────
 const app = express();
-
-app.get("/", (req, res) => {
-  res.send("🤖 Freddy is alive and running!");
-});
-
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", bot: "Freddy", uptime: process.uptime() });
-});
-
-app.listen(PORT, () => {
-  console.log(`🌐 Keep-alive server running on port ${PORT}`);
-});
+app.get("/",       (_, res) => res.send("🤖 Freddy v2 is alive!"));
+app.get("/health", (_, res) => res.json({ status: "ok", uptime: process.uptime() }));
+app.listen(PORT, () => console.log(`🌐 Keep-alive on port ${PORT}`));
 
 // ── Telegram + Groq ──────────────────────────────────────────────────────────
 const bot  = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-// ── Freddy's Persona ─────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Freddy, a friendly and helpful AI agent on Telegram.
+// ── Persona ──────────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are Freddy, a friendly and capable AI agent on Telegram.
 
-Your personality:
-- Warm, cheerful, and approachable — like a knowledgeable best friend
-- You speak casually but clearly. No stiff corporate tone.
-- You use light humor when appropriate but never overdo it
-- You are proactive: if the user seems stuck, offer the next step yourself
-- You can help with tasks, answer questions, write, code, plan, brainstorm — you're a capable agent
-- Keep replies concise unless the user clearly wants detail
-- Use emojis sparingly (1–2 max per message, only when natural)
-- Never say "As an AI..." or "I'm just a language model..." — you ARE Freddy.`;
+Personality:
+- Warm, cheerful, approachable — like a knowledgeable best friend
+- Casual but clear. No corporate tone.
+- Proactive: suggest next steps when users seem stuck
+- Use emojis sparingly (1–2 max, only when natural)
+- Never say "As an AI..." — you ARE Freddy
 
-// ── Per-user conversation memory ─────────────────────────────────────────────
+Capabilities (use when relevant):
+- Web search: if asked about current events/news/prices, tell user to use /search <query>
+- Voice: user can request voice reply with /voice <message>
+- Summarize: user can paste a URL with /summarize <url>
+- File: user can request a file with /file <description of what to write>
+
+Keep replies concise unless detail is needed.`;
+
+// ── Memory ───────────────────────────────────────────────────────────────────
 const conversations = {};
-
-function getHistory(userId) {
-  if (!conversations[userId]) conversations[userId] = [];
-  return conversations[userId];
+function getHistory(uid) {
+  if (!conversations[uid]) conversations[uid] = [];
+  return conversations[uid];
 }
-
-function addToHistory(userId, role, content) {
-  const history = getHistory(userId);
-  history.push({ role, content });
-  if (history.length > 20) history.splice(0, history.length - 20);
+function addToHistory(uid, role, content) {
+  const h = getHistory(uid);
+  h.push({ role, content });
+  if (h.length > 20) h.splice(0, h.length - 20);
 }
 
 // ── Thinking animation ────────────────────────────────────────────────────────
-const THINKING_FRAMES = [
-  "✦ Thinking",
-  "✦ Thinking.",
-  "✦ Thinking..",
-  "✦ Thinking...",
-];
+const FRAMES = ["✦ Thinking", "✦ Thinking.", "✦ Thinking..", "✦ Thinking..."];
 
-async function sendThinkingMessage(chatId) {
-  const msg = await bot.sendMessage(chatId, THINKING_FRAMES[0]);
+async function sendThinking(chatId) {
+  const msg = await bot.sendMessage(chatId, FRAMES[0]);
   return msg.message_id;
 }
 
-function animateThinking(chatId, messageId, stopSignal) {
-  let frame = 0;
-  const interval = setInterval(async () => {
-    if (stopSignal.stopped) {
-      clearInterval(interval);
-      return;
-    }
-    frame = (frame + 1) % THINKING_FRAMES.length;
-    try {
-      await bot.editMessageText(THINKING_FRAMES[frame], {
-        chat_id: chatId,
-        message_id: messageId,
-      });
-    } catch (_) {}
+function animateThinking(chatId, msgId, stop) {
+  let f = 0;
+  setInterval(async () => {
+    if (stop.stopped) return;
+    f = (f + 1) % FRAMES.length;
+    try { await bot.editMessageText(FRAMES[f], { chat_id: chatId, message_id: msgId }); } catch (_) {}
   }, 1000);
-  return interval;
 }
 
-// ── Message handler ───────────────────────────────────────────────────────────
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text   = msg.text?.trim();
+// ── Groq helper ───────────────────────────────────────────────────────────────
+async function askGroq(uid, userMsg, extraContext = "") {
+  addToHistory(uid, "user", userMsg + (extraContext ? `\n\n[Context]:\n${extraContext}` : ""));
+  const res = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [{ role: "system", content: SYSTEM_PROMPT }, ...getHistory(uid)],
+    temperature: 0.75,
+    max_tokens: 1024,
+  });
+  const reply = res.choices[0]?.message?.content?.trim() || "Hmm, no response. Try again?";
+  addToHistory(uid, "assistant", reply);
+  return reply;
+}
 
-  if (!text) return;
-
-  if (text === "/start") {
-    const firstName = msg.from.first_name || "there";
-    await bot.sendMessage(
-      chatId,
-      `Hey ${firstName}! 👋 I'm Freddy, your friendly AI agent.\n\nAsk me anything — I'm here to help!`
-    );
-    return;
-  }
-
-  if (text === "/reset") {
-    conversations[userId] = [];
-    await bot.sendMessage(chatId, "Memory cleared! Fresh start 🧹");
-    return;
-  }
-
-  addToHistory(userId, "user", text);
-
-  await bot.sendChatAction(chatId, "typing");
-  const thinkingMsgId = await sendThinkingMessage(chatId);
-  const stopSignal    = { stopped: false };
-  animateThinking(chatId, thinkingMsgId, stopSignal);
-
+// ── Web Search (DuckDuckGo) ───────────────────────────────────────────────────
+async function webSearch(query) {
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...getHistory(userId),
-      ],
-      temperature: 0.75,
-      max_tokens: 1024,
+    const res = await axios.get(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`, {
+      headers: { "User-Agent": "FreddyBot/2.0" },
+      timeout: 8000,
     });
+    const d = res.data;
+    let result = "";
+    if (d.AbstractText) result += d.AbstractText;
+    if (d.RelatedTopics?.length) {
+      const topics = d.RelatedTopics.slice(0, 3)
+        .filter(t => t.Text)
+        .map(t => `• ${t.Text}`)
+        .join("\n");
+      if (topics) result += (result ? "\n\n" : "") + topics;
+    }
+    return result || "No direct results found. Try a more specific query.";
+  } catch (e) {
+    return "Search failed: " + e.message;
+  }
+}
 
-    const reply = completion.choices[0]?.message?.content?.trim()
-      || "Hmm, I didn't get a response. Try again?";
+// ── Link Summarizer ───────────────────────────────────────────────────────────
+async function fetchPageText(url) {
+  const res = await axios.get(url, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    timeout: 10000,
+  });
+  const $ = cheerio.load(res.data);
+  $("script, style, nav, footer, header, aside").remove();
+  const text = $("body").text().replace(/\s+/g, " ").trim().slice(0, 4000);
+  return text;
+}
 
-    stopSignal.stopped = true;
+// ── Voice TTS ─────────────────────────────────────────────────────────────────
+async function textToVoice(text, chatId) {
+  const tmpFile = path.join(os.tmpdir(), `freddy_${Date.now()}.mp3`);
+  await new Promise((resolve, reject) => {
+    const tts = new gTTS(text.slice(0, 500), "en");
+    tts.save(tmpFile, (err) => err ? reject(err) : resolve());
+  });
+  await bot.sendVoice(chatId, tmpFile);
+  fs.unlinkSync(tmpFile);
+}
 
-    await bot.editMessageText(reply, {
-      chat_id: chatId,
-      message_id: thinkingMsgId,
-      parse_mode: "Markdown",
-    });
+// ── File Creator ──────────────────────────────────────────────────────────────
+async function createAndSendFile(uid, description, chatId) {
+  const content = await askGroq(uid, `Write the full content for a file described as: "${description}". Output ONLY the file content, no explanation.`);
+  const ext = description.match(/\.(js|py|txt|html|css|json|md)/) ? description.match(/\.(js|py|txt|html|css|json|md)/)[0] : ".txt";
+  const tmpFile = path.join(os.tmpdir(), `freddy_file_${Date.now()}${ext}`);
+  fs.writeFileSync(tmpFile, content);
+  await bot.sendDocument(chatId, tmpFile, {}, { filename: `freddy_output${ext}` });
+  fs.unlinkSync(tmpFile);
+}
 
-    addToHistory(userId, "assistant", reply);
+// ── Commands ──────────────────────────────────────────────────────────────────
+bot.onText(/\/start/, async (msg) => {
+  const name = msg.from.first_name || "there";
+  await bot.sendMessage(msg.chat.id,
+    `Hey ${name}! 👋 I'm *Freddy v2*, your friendly AI agent.\n\n` +
+    `*What I can do:*\n` +
+    `🌐 /search <query> — Web search\n` +
+    `🎵 /voice <text> — Voice reply\n` +
+    `📝 /summarize <url> — Summarize a link\n` +
+    `📁 /file <description> — Create a file\n` +
+    `🧹 /reset — Clear memory\n\n` +
+    `Or just chat with me normally!`,
+    { parse_mode: "Markdown" }
+  );
+});
 
-  } catch (err) {
-    stopSignal.stopped = true;
-    console.error("Error:", err.message);
-    try {
-      await bot.editMessageText("⚠️ Something went wrong. Try again!", {
-        chat_id: chatId,
-        message_id: thinkingMsgId,
-      });
-    } catch (_) {}
+bot.onText(/\/reset/, async (msg) => {
+  conversations[msg.from.id] = [];
+  await bot.sendMessage(msg.chat.id, "Memory cleared! Fresh start 🧹");
+});
+
+// /search
+bot.onText(/\/search (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const query  = match[1];
+  const stop   = { stopped: false };
+  const mid    = await sendThinking(chatId);
+  animateThinking(chatId, mid, stop);
+  try {
+    const searchResult = await webSearch(query);
+    const reply = await askGroq(msg.from.id, `User searched for: "${query}"`, searchResult);
+    stop.stopped = true;
+    await bot.editMessageText(reply, { chat_id: chatId, message_id: mid, parse_mode: "Markdown" });
+  } catch (e) {
+    stop.stopped = true;
+    await bot.editMessageText("⚠️ Search failed: " + e.message, { chat_id: chatId, message_id: mid });
   }
 });
 
-console.log("🤖 Freddy is online!");
+// /voice
+bot.onText(/\/voice (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const text   = match[1];
+  const stop   = { stopped: false };
+  const mid    = await sendThinking(chatId);
+  animateThinking(chatId, mid, stop);
+  try {
+    const reply = await askGroq(msg.from.id, text);
+    stop.stopped = true;
+    await bot.editMessageText(reply, { chat_id: chatId, message_id: mid, parse_mode: "Markdown" });
+    await textToVoice(reply, chatId);
+  } catch (e) {
+    stop.stopped = true;
+    await bot.editMessageText("⚠️ Voice failed: " + e.message, { chat_id: chatId, message_id: mid });
+  }
+});
+
+// /summarize
+bot.onText(/\/summarize (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const url    = match[1].trim();
+  const stop   = { stopped: false };
+  const mid    = await sendThinking(chatId);
+  animateThinking(chatId, mid, stop);
+  try {
+    const pageText = await fetchPageText(url);
+    const reply    = await askGroq(msg.from.id, `Summarize this webpage content clearly and concisely:`, pageText);
+    stop.stopped = true;
+    await bot.editMessageText(reply, { chat_id: chatId, message_id: mid, parse_mode: "Markdown" });
+  } catch (e) {
+    stop.stopped = true;
+    await bot.editMessageText("⚠️ Could not fetch that URL: " + e.message, { chat_id: chatId, message_id: mid });
+  }
+});
+
+// /file
+bot.onText(/\/file (.+)/, async (msg, match) => {
+  const chatId      = msg.chat.id;
+  const description = match[1];
+  const stop        = { stopped: false };
+  const mid         = await sendThinking(chatId);
+  animateThinking(chatId, mid, stop);
+  try {
+    await createAndSendFile(msg.from.id, description, chatId);
+    stop.stopped = true;
+    await bot.editMessageText("📁 Here's your file!", { chat_id: chatId, message_id: mid });
+  } catch (e) {
+    stop.stopped = true;
+    await bot.editMessageText("⚠️ File creation failed: " + e.message, { chat_id: chatId, message_id: mid });
+  }
+});
+
+// Normal chat
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+  const chatId = msg.chat.id;
+  const stop   = { stopped: false };
+  const mid    = await sendThinking(chatId);
+  animateThinking(chatId, mid, stop);
+  try {
+    const reply = await askGroq(msg.from.id, msg.text);
+    stop.stopped = true;
+    await bot.editMessageText(reply, { chat_id: chatId, message_id: mid, parse_mode: "Markdown" });
+  } catch (e) {
+    stop.stopped = true;
+    await bot.editMessageText("⚠️ Something went wrong. Try again!", { chat_id: chatId, message_id: mid });
+  }
+});
+
+console.log("🤖 Freddy v2 is online!");
